@@ -113,6 +113,13 @@ class System(SimObject):
         "shmem segment file upon destruction. This is used only if "
         "shared_backstore is non-empty.",
     )
+    shared_backstore_is_file = Param.Bool(
+        False, "Map an existing file without resizing or unlinking it"
+    )
+    shared_backstore_offset = Param.Addr(0, "Offset in the external file")
+    shared_backstore_limit = Param.MemorySize(
+        "0B", "Maximum bytes assigned to this external file region"
+    )
 
     cache_line_size = Param.Unsigned(64, "Cache line size in bytes")
 

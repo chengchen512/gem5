@@ -39,6 +39,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <unistd.h>
@@ -48,6 +49,7 @@
 #include <climits>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "base/intmath.hh"
@@ -76,15 +78,27 @@ namespace gem5
 namespace memory
 {
 
-PhysicalMemory::PhysicalMemory(const std::string& _name,
-                               const std::vector<AbstractMemory*>& _memories,
-                               bool mmap_using_noreserve,
-                               const std::string& shared_backstore,
-                               bool auto_unlink_shared_backstore) :
-    _name(_name), size(0), mmapUsingNoReserve(mmap_using_noreserve),
-    sharedBackstore(shared_backstore), sharedBackstoreSize(0),
-    pageSize(sysconf(_SC_PAGE_SIZE))
+PhysicalMemory::PhysicalMemory(
+    const std::string &_name, const std::vector<AbstractMemory *> &_memories,
+    bool mmap_using_noreserve, const std::string &shared_backstore,
+    bool auto_unlink_shared_backstore, bool shared_backstore_is_file,
+    uint64_t shared_backstore_offset, uint64_t shared_backstore_limit)
+    : _name(_name),
+      size(0),
+      mmapUsingNoReserve(mmap_using_noreserve),
+      sharedBackstore(shared_backstore),
+      sharedBackstoreSize(0),
+      sharedBackstoreIsFile(shared_backstore_is_file),
+      sharedBackstoreOffset(shared_backstore_offset),
+      sharedBackstoreLimit(shared_backstore_limit),
+      pageSize(sysconf(_SC_PAGE_SIZE))
 {
+    fatal_if(sharedBackstoreIsFile &&
+                 (sharedBackstore.empty() || !sharedBackstoreLimit ||
+                  sharedBackstoreOffset % pageSize),
+             "File backstore requires a path, size and page-aligned offset");
+    fatal_if(sharedBackstoreIsFile && auto_unlink_shared_backstore,
+             "External file backstore must be removed by its owner");
     // Register cleanup callback if requested.
     if (auto_unlink_shared_backstore && !sharedBackstore.empty()) {
         registerExitCallback([=]() { shm_unlink(shared_backstore.c_str()); });
@@ -218,17 +232,39 @@ PhysicalMemory::createBackingStore(
         map_offset = 0;
     } else {
         // Newly create backstore will be located after previous one.
-        map_offset = sharedBackstoreSize;
+        const uint64_t offset = sharedBackstoreSize;
         // mmap requires the offset to be multiple of page, so we need to
         // upscale the range size.
-        sharedBackstoreSize += roundUp(range.size(), pageSize);
+        const uint64_t length = roundUp(range.size(), pageSize);
+        fatal_if(length < range.size() ||
+                     offset > std::numeric_limits<uint64_t>::max() - length,
+                 "Shared backing store size overflow");
+        sharedBackstoreSize += length;
+        fatal_if(sharedBackstoreSize >
+                         uint64_t(std::numeric_limits<off_t>::max()) ||
+                     sharedBackstoreOffset >
+                         std::numeric_limits<off_t>::max() -
+                             sharedBackstoreSize,
+                 "Shared backing store file offset overflow");
+        map_offset = sharedBackstoreOffset + offset;
         DPRINTF(AddrRanges, "Sharing backing store as %s at offset %llu\n",
                 sharedBackstore.c_str(), (uint64_t)map_offset);
-        shm_fd = shm_open(sharedBackstore.c_str(), O_CREAT | O_RDWR, 0666);
+        shm_fd = sharedBackstoreIsFile ? open(sharedBackstore.c_str(), O_RDWR)
+                                       : shm_open(sharedBackstore.c_str(),
+                                                  O_CREAT | O_RDWR, 0666);
         if (shm_fd == -1)
                panic("Shared memory failed");
-        if (ftruncate(shm_fd, sharedBackstoreSize))
-               panic("Setting size of shared memory failed");
+        if (sharedBackstoreIsFile) {
+            struct stat info;
+            fatal_if(sharedBackstoreSize > sharedBackstoreLimit,
+                     "Memory exceeds its assigned pool region");
+            fatal_if(fstat(shm_fd, &info) || info.st_size < 0 ||
+                         uint64_t(info.st_size) <
+                             sharedBackstoreOffset + sharedBackstoreSize,
+                     "External shared backing file is too small");
+        } else if (ftruncate(shm_fd, sharedBackstoreSize)) {
+            panic("Setting size of shared memory failed");
+        }
         map_flags = MAP_SHARED;
     }
 

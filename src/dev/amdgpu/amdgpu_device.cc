@@ -61,7 +61,9 @@ AMDGPUDevice::AMDGPUDevice(const AMDGPUDeviceParams &p)
       init_interrupt_count(0),
       _lastVMID(0),
       deviceMem(name() + ".deviceMem", p.memories, false,
-                p.vram_shared_backstore, false),
+                p.vram_shared_backstore, !p.vram_shared_backstore_is_file,
+                p.vram_shared_backstore_is_file,
+                p.vram_shared_backstore_offset, p.vram_shared_backstore_limit),
       system(p.system),
       gpuId(p.gpu_id)
 {
@@ -279,6 +281,17 @@ AMDGPUDevice::AMDGPUDevice(const AMDGPUDeviceParams &p)
     }
 }
 
+memory::BackingStoreEntry
+AMDGPUDevice::getVRAMBacking() const
+{
+    const auto stores = deviceMem.getBackingStore();
+    fatal_if(stores.size() != 1 || !stores.front().pmem ||
+                 stores.front().range.start() != vramAddrOffset ||
+                 stores.front().range.size() != vramSize,
+             "Co-simulation requires one contiguous GPU VRAM backing");
+    return stores.front();
+}
+
 void
 AMDGPUDevice::readROM(PacketPtr pkt)
 {
@@ -329,7 +342,10 @@ AMDGPUDevice::getAddrRanges() const
 {
     AddrRangeList ranges = PciEndpoint::getAddrRanges();
     AddrRangeList ret_ranges;
-    ret_ranges.push_back(romRange);
+    // Only GPU 0 decodes the legacy VGA ROM window.
+    if (gpuId == 0 || romRange.start() != VGA_ROM_DEFAULT) {
+        ret_ranges.push_back(romRange);
+    }
 
     // If the range starts at zero assume OS hasn't assigned it yet. Do not
     // return ranges starting with zero as they will surely overlap with

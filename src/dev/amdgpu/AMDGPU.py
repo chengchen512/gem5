@@ -106,6 +106,13 @@ class AMDGPUDevice(PciEndpoint):
         "POSIX shared memory name for VRAM backing store. "
         "Used in cosim mode to share VRAM between QEMU and gem5.",
     )
+    vram_shared_backstore_is_file = Param.Bool(
+        False, "Map VRAM from an externally managed file"
+    )
+    vram_shared_backstore_offset = Param.Addr(0, "VRAM file offset")
+    vram_shared_backstore_limit = Param.MemorySize(
+        "0B", "Size of the assigned VRAM file region"
+    )
 
 
 class SDMAEngine(DmaVirtDevice):

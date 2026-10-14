@@ -107,8 +107,15 @@ def create_TLB_Coalescer(
 
 
 def config_tlb_hierarchy(
-    options, system, shader_idx, gpu_ctrl=None, full_system=False
+    options,
+    system,
+    shader_idx,
+    gpu_ctrl=None,
+    full_system=False,
+    tlb_owner=None,
 ):
+    if tlb_owner is None:
+        tlb_owner = system
     n_cu = options.num_compute_units
 
     if options.TLB_config == "perLane":
@@ -158,7 +165,7 @@ def config_tlb_hierarchy(
 
     # -------------------------------------------------------------------------
     # Create the hiearchy
-    # Call the appropriate constructors and add objects to the system
+    # Call the appropriate constructors and attach objects to their owner
 
     for i in range(len(TLB_hierarchy)):
         hierarchy_level = TLB_hierarchy[i]
@@ -187,11 +194,9 @@ def config_tlb_hierarchy(
             system_TLB_name = TLB_type["name"] + "_tlb"
             system_Coalescer_name = TLB_type["name"] + "_coalescer"
 
-            # add the different TLB levels to the system
-            # Modify here if you want to make the TLB hierarchy a child of
-            # the shader.
-            exec(f"system.{system_TLB_name} = TLB_array")
-            exec(f"system.{system_Coalescer_name} = Coalescer_array")
+            # Keep every hierarchy attached to its configured owner.
+            setattr(tlb_owner, system_TLB_name, TLB_array)
+            setattr(tlb_owner, system_Coalescer_name, Coalescer_array)
 
     # ===========================================================
     # Specify the TLB hierarchy (i.e., port connections)
@@ -208,8 +213,8 @@ def config_tlb_hierarchy(
             name = TLB_type["name"]
             for index in range(TLB_type["width"]):
                 exec(
-                    "system.%s_coalescer[%d].mem_side_ports[0] = \
-                        system.%s_tlb[%d].cpu_side_ports[0]"
+                    "tlb_owner.%s_coalescer[%d].mem_side_ports[0] = \
+                        tlb_owner.%s_tlb[%d].cpu_side_ports[0]"
                     % (name, index, name, index)
                 )
 
@@ -225,7 +230,7 @@ def config_tlb_hierarchy(
                     for tlb in range(tlb_per_cu):
                         exec(
                             "system.cpu[%d].CUs[%d].translation_port[%d] = \
-                                system.l1_coalescer[%d].cpu_side_ports[%d]"
+                                tlb_owner.l1_coalescer[%d].cpu_side_ports[%d]"
                             % (
                                 shader_idx,
                                 cu_idx,
@@ -237,7 +242,7 @@ def config_tlb_hierarchy(
                 else:
                     exec(
                         "system.cpu[%d].CUs[%d].translation_port[%d] = \
-                            system.l1_coalescer[%d].cpu_side_ports[%d]"
+                            tlb_owner.l1_coalescer[%d].cpu_side_ports[%d]"
                         % (
                             shader_idx,
                             cu_idx,
@@ -252,7 +257,7 @@ def config_tlb_hierarchy(
                 sqc_tlb_port_id = index % options.cu_per_sqc
                 exec(
                     "system.cpu[%d].CUs[%d].sqc_tlb_port = \
-                        system.sqc_coalescer[%d].cpu_side_ports[%d]"
+                        tlb_owner.sqc_coalescer[%d].cpu_side_ports[%d]"
                     % (shader_idx, index, sqc_tlb_index, sqc_tlb_port_id)
                 )
         elif name == "scalar":  # Scalar D-TLB
@@ -261,7 +266,7 @@ def config_tlb_hierarchy(
                 scalar_tlb_port_id = index % options.cu_per_scalar_cache
                 exec(
                     "system.cpu[%d].CUs[%d].scalar_tlb_port = \
-                        system.scalar_coalescer[%d].cpu_side_ports[%d]"
+                        tlb_owner.scalar_coalescer[%d].cpu_side_ports[%d]"
                     % (shader_idx, index, scalar_tlb_index, scalar_tlb_port_id)
                 )
 
@@ -274,16 +279,16 @@ def config_tlb_hierarchy(
         name = TLB_type["name"]
         for index in range(TLB_type["width"]):
             exec(
-                "system.%s_tlb[%d].mem_side_ports[0] = \
-                    system.l2_coalescer[0].cpu_side_ports[%d]"
+                "tlb_owner.%s_tlb[%d].mem_side_ports[0] = \
+                    tlb_owner.l2_coalescer[0].cpu_side_ports[%d]"
                 % (name, index, l2_coalescer_index)
             )
             l2_coalescer_index += 1
 
     # L2 <-> L3
-    system.l2_tlb[0].mem_side_ports[0] = system.l3_coalescer[0].cpu_side_ports[
+    tlb_owner.l2_tlb[0].mem_side_ports[0] = tlb_owner.l3_coalescer[
         0
-    ]
+    ].cpu_side_ports[0]
 
     # L3 TLB Vega page table walker to memory for full system only
     if full_system:
@@ -291,7 +296,7 @@ def config_tlb_hierarchy(
             name = TLB_type["name"]
             for index in range(TLB_type["width"]):
                 exec(
-                    "system._dma_ports.append(system.%s_tlb[%d].walker)"
+                    "system._dma_ports.append(tlb_owner.%s_tlb[%d].walker)"
                     % (name, index)
                 )
 

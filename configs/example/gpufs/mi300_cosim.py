@@ -45,7 +45,10 @@ Shared memory:
     /dev/shm/mi300x-vram-{0..N}  - per-GPU VRAM (multi-GPU)
 """
 
+from __future__ import annotations
+
 import argparse
+import json
 import math
 import os
 
@@ -73,6 +76,19 @@ from system.amdgpu import (
 
 
 def addCosimOptions(parser):
+    parser.add_argument(
+        "--shared-pool",
+        default="",
+        help="Existing pool file containing guest RAM and this GPU's VRAM",
+    )
+    parser.add_argument(
+        "--pool-vram-offset", type=int, default=0, help="VRAM byte offset"
+    )
+    parser.add_argument(
+        "--host-memory-ranges",
+        type=json.loads,
+        help="JSON array of guest RAM start, size and pool offset values",
+    )
     parser.add_argument(
         "--socket-path",
         type=str,
@@ -147,9 +163,18 @@ def _create_per_gpu_components(system, args, gpu_id, num_gpus):
     """
     # GPU device (PCI)
     gpu = connectGPU(system, args, gpu_id)
+    if gpu_id > 0:
+        setattr(system, f"gpu{gpu_id}", gpu)
+    gpu.upstream = system.pc.pci_host
+    gpu.BAR4 = PciMemBar(size="8KiB")
     gpu.vram_shared_backstore = _gpu_shmem_path(
         args.shmem_path, gpu_id, num_gpus
     )
+    if args.shared_pool:
+        gpu.vram_shared_backstore = args.shared_pool
+        gpu.vram_shared_backstore_is_file = True
+        gpu.vram_shared_backstore_offset = args.pool_vram_offset
+        gpu.vram_shared_backstore_limit = args.dgpu_mem_size
 
     # Shader (CU array)
     shader = createGPU(system, args, gpu_id)
@@ -270,6 +295,59 @@ def _create_per_gpu_components(system, args, gpu_id, num_gpus):
     return gpu, shader, dma_ports
 
 
+def _host_memory_ranges(ranges: object, total_size: int) -> tuple[list, int]:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    if ranges is None:
+        low_limit = 0x80000000 if total_size >= 0xB0000000 else 0xB0000000
+        low_size = min(total_size, low_limit)
+        ranges = [{"start": 0, "size": low_size, "offset": 0}]
+        if total_size > low_size:
+            ranges.append(
+                {
+                    "start": 0x100000000,
+                    "size": total_size - low_size,
+                    "offset": low_size,
+                }
+            )
+    if not isinstance(ranges, list) or not 1 <= len(ranges) <= 64:
+        raise ValueError("host memory map requires 1..64 ranges")
+    result = []
+    base_offset = None
+    expected_offset = 0
+    previous_end = 0
+    for entry in ranges:
+        if not isinstance(entry, dict) or set(entry) != {
+            "start",
+            "size",
+            "offset",
+        }:
+            raise ValueError("host memory range requires start, size, offset")
+        start, size, offset = (entry["start"], entry["size"], entry["offset"])
+        if any(type(value) is not int for value in (start, size, offset)):
+            raise ValueError("host memory range values must be integers")
+        if base_offset is None:
+            base_offset = expected_offset = offset
+        if offset < 0 or offset + size > (1 << 63) - 1:
+            raise ValueError("host memory backing offset overflows")
+        if start < previous_end or size <= 0 or start + size >= 1 << 64:
+            raise ValueError("host memory range overlaps or overflows")
+        if (
+            start % page_size
+            or size % page_size
+            or offset % page_size
+            or offset != expected_offset
+        ):
+            raise ValueError(
+                "host memory range alignment or offset is invalid"
+            )
+        result.append(AddrRange(start, size=size))
+        previous_end = start + size
+        expected_offset += size
+    if expected_offset - base_offset != total_size:
+        raise ValueError("host memory map size must equal --mem-size")
+    return result, base_offset
+
+
 def buildCosimSystem(args):
     """Build a minimal gem5 GPU-only system for cosimulation with QEMU.
 
@@ -280,6 +358,9 @@ def buildCosimSystem(args):
     num_gpus = getattr(args, "num_gpus", 1)
     if num_gpus < 1:
         m5.util.panic("--num-gpus must be >= 1")
+    if args.shared_pool:
+        if num_gpus != 1:
+            m5.util.panic("--shared-pool requires one GPU per process")
 
     per_gpu_cus = args.num_compute_units
 
@@ -296,23 +377,31 @@ def buildCosimSystem(args):
     system.mem_mode = "atomic_noncaching"
     system.m5ops_base = 0xFFFF0000
 
-    # Memory ranges — must match QEMU Q35's memory split
     total_mem = convert.toMemorySize(args.mem_size)
-    lowmem_limit = 0x80000000 if total_mem >= 0xB0000000 else 0xB0000000
-    below_4g = min(total_mem, lowmem_limit)
-    above_4g = total_mem - below_4g
-
-    if above_4g > 0:
-        system.mem_ranges = [
-            AddrRange(below_4g),
-            AddrRange(Addr("4GiB"), size=above_4g),
-        ]
-    else:
-        system.mem_ranges = [AddrRange(total_mem)]
+    ranges, ram_offset = _host_memory_ranges(
+        args.host_memory_ranges, total_mem
+    )
+    system.mem_ranges = ranges
+    if ram_offset and not args.shared_pool:
+        m5.util.panic("Nonzero host RAM offsets require --shared-pool")
 
     # Share host memory with QEMU via POSIX shared memory
     system.shared_backstore = args.shmem_host_path
     system.auto_unlink_shared_backstore = True
+    if args.shared_pool:
+        vram_end = args.pool_vram_offset + convert.toMemorySize(
+            args.dgpu_mem_size
+        )
+        if (
+            args.pool_vram_offset < ram_offset + total_mem
+            and ram_offset < vram_end
+        ):
+            m5.util.panic("Pool VRAM overlaps guest RAM")
+        system.shared_backstore = args.shared_pool
+        system.shared_backstore_is_file = True
+        system.shared_backstore_offset = ram_offset
+        system.shared_backstore_limit = args.mem_size
+        system.auto_unlink_shared_backstore = False
 
     # PCI infrastructure
     system.pc = Pc()
@@ -359,17 +448,17 @@ def buildCosimSystem(args):
         # Accumulate DMA ports
         system._dma_ports.extend(dma_ports)
 
-    # Store GPU list on system for external access
-    if num_gpus > 1:
-        system.gpu_devices = gpu_devices
-
     # ----------------------------------------------------------------
     # TLB hierarchy (per GPU)
     # ----------------------------------------------------------------
     args.full_system = True
-    # Temporarily set total CU count for TLB config
+    # Configure each GPU's local translation hierarchy.
     saved_cus = args.num_compute_units
     args.num_compute_units = per_gpu_cus
+    args.num_sqc = int(math.ceil(float(per_gpu_cus) / args.cu_per_sqc))
+    args.num_scalar_cache = int(
+        math.ceil(float(per_gpu_cus) / args.cu_per_scalar_cache)
+    )
     for gpu_id in range(num_gpus):
         GPUTLBConfig.config_tlb_hierarchy(
             args,
@@ -377,6 +466,7 @@ def buildCosimSystem(args):
             shader_indices[gpu_id],
             gpu_devices[gpu_id],
             True,
+            tlb_owner=gpu_devices[gpu_id],
         )
     args.num_compute_units = saved_cus
 
@@ -477,13 +567,9 @@ def buildCosimSystem(args):
     cosim_bridges = []
     for gpu_id in range(num_gpus):
         sock = _gpu_socket_path(args.socket_path, gpu_id, num_gpus)
-        shmem = _gpu_shmem_path(args.shmem_path, gpu_id, num_gpus)
-
         bridge = MI300XVfioUser(
             gpu_device=gpu_devices[gpu_id],
             socket_path=sock,
-            shmem_path=shmem,
-            vram_size=args.dgpu_mem_size,
         )
         cosim_bridges.append(bridge)
 
@@ -552,7 +638,7 @@ if __name__ == "__m5_main__":
     from example.gpufs.runfs import addRunFSOptions
 
     addRunFSOptions(parser)
-
+    parser.set_defaults(mem_size="8GiB", num_compute_units=40)
     args = parser.parse_args()
 
     if not hasattr(m5.objects, "MI300XVfioUser"):
@@ -565,8 +651,6 @@ if __name__ == "__m5_main__":
     # Cosim defaults
     args.num_cpus = 1
     args.cpu_type = "AtomicSimpleCPU"
-    args.mem_size = "8GiB"
-    args.num_compute_units = 40
     if not hasattr(args, "gpu_topology") or args.gpu_topology is None:
         args.gpu_topology = "Crossbar"
     if not hasattr(args, "cpu_topology") or args.cpu_topology is None:
@@ -595,20 +679,22 @@ if __name__ == "__m5_main__":
     m5.instantiate()
 
     print("=" * 60)
-    print("gem5 MI300X co-simulation server ready")
+    print("gem5 MI300X co-simulation configuration")
     print("  Backend:    vfio-user")
     print(f"  Num GPUs:   {num_gpus}")
     for gpu_id in range(num_gpus):
         sock = _gpu_socket_path(args.socket_path, gpu_id, num_gpus)
-        shmem = _gpu_shmem_path(args.shmem_path, gpu_id, num_gpus)
+        shmem = args.shared_pool or _gpu_shmem_path(
+            args.shmem_path, gpu_id, num_gpus
+        )
         print(f"  GPU {gpu_id}:")
         print(f"    Socket:   {sock}")
         print(f"    VRAM SHM: {shmem}")
-    print(f"  Host SHM:   {args.shmem_host_path}")
+    print(f"  Host SHM:   {args.shared_pool or args.shmem_host_path}")
     print(f"  VRAM size:  {args.dgpu_mem_size}")
     print(f"  Host RAM:   {args.mem_size}")
     print(f"  CUs/GPU:    {args.num_compute_units}")
-    print("Waiting for QEMU to connect...")
+    print("Starting vfio-user listeners...")
     print("=" * 60)
 
     exit_event = m5.simulate()

@@ -53,10 +53,3 @@ class MI300XVfioUser(SimObject):
         "/tmp/gem5-mi300x.sock",
         "Unix domain socket path for vfio-user connection",
     )
-
-    shmem_path = Param.String(
-        "/mi300x-vram",
-        "POSIX shared memory name for VRAM (e.g. /mi300x-vram)",
-    )
-
-    vram_size = Param.MemorySize("16GiB", "Size of VRAM shared memory region")

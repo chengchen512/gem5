@@ -32,8 +32,6 @@
 #ifndef __DEV_AMDGPU_MI300X_VFIO_USER_HH__
 #define __DEV_AMDGPU_MI300X_VFIO_USER_HH__
 
-#include <sys/mman.h>
-
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -73,6 +71,7 @@
 #include "base/types.hh"
 #include "dev/amdgpu/amdgpu_defines.hh"
 #include "dev/amdgpu/cosim_bridge.hh"
+#include "mem/physical.hh"
 #include "params/MI300XVfioUser.hh"
 #include "sim/eventq.hh"
 #include "sim/sim_object.hh"
@@ -161,14 +160,8 @@ class MI300XVfioUser : public SimObject, public CosimBridge
     void gpuMmioWrite(uint64_t offset, uint32_t size, uint64_t data);
     uint64_t gpuDoorbellRead(uint64_t offset, uint32_t size);
     void gpuDoorbellWrite(uint64_t offset, uint32_t size, uint64_t data);
-    uint64_t gpuFrameRead(uint64_t offset, uint32_t size);
-    void gpuFrameWrite(uint64_t offset, uint32_t size, uint64_t data);
     uint64_t gpuConfigRead(uint64_t offset, uint32_t size);
     void gpuConfigWrite(uint64_t offset, uint32_t size, uint64_t data);
-
-    // -- Shared memory (VRAM) --
-    void setupSharedMemory();
-    void cleanupSharedMemory();
 
     // -- Event loop integration --
     class VfuPollEvent : public PollEvent
@@ -187,18 +180,14 @@ class MI300XVfioUser : public SimObject, public CosimBridge
     AMDGPUDevice *gpuDevice;
 
     std::string socketPath;
-    std::string shmemPath;
-    Addr vramSize;
+    // The GPU must outlive this bridge and its vfio-user context.
+    const memory::BackingStoreEntry vramBacking;
 
     // libvfio-user context
     vfu_ctx_t *vfuCtx = nullptr;
     std::unique_ptr<VfuPollEvent> vfuPollEvent;
     int vfuPollFd = -1;
     bool clientAttached = false;
-
-    // VRAM shared memory
-    void *shmemPtr = MAP_FAILED;
-    int shmemFd = -1;
 
     // Guest RAM DMA mappings (GPA -> host ptr)
     struct DmaMapping

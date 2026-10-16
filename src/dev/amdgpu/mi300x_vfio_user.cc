@@ -31,8 +31,6 @@
 
 #include "dev/amdgpu/mi300x_vfio_user.hh"
 
-#include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -59,15 +57,12 @@ MI300XVfioUser::MI300XVfioUser(const Params &p)
     : SimObject(p),
       gpuDevice(p.gpu_device),
       socketPath(p.socket_path),
-      shmemPath(p.shmem_path),
-      vramSize(p.vram_size),
+      vramBacking(gpuDevice->getVRAMBacking()),
       keepaliveEvent([this] { processKeepalive(); }, name())
 {}
 
 MI300XVfioUser::~MI300XVfioUser()
 {
-    cleanupSharedMemory();
-
     if (vfuCtx) {
         vfu_destroy_ctx(vfuCtx);
         vfuCtx = nullptr;
@@ -105,10 +100,9 @@ MI300XVfioUser::startup()
         return;
     }
 
-    // Set up VRAM shared memory first (needed for BAR0 mmap fd)
-    if (!shmemPath.empty()) {
-        setupSharedMemory();
-    }
+    gpuDevice->getVM().vramShmemPtr = vramBacking.pmem;
+    gpuDevice->getVM().vramShmemSize = vramBacking.range.size();
+    gpuDevice->getVM().setupWalkerCosim();
 
     initVfuContext();
 
@@ -214,16 +208,17 @@ void
 MI300XVfioUser::setupBars()
 {
     int ret;
+    const Addr vramSize = vramBacking.range.size();
 
     // BAR0: VRAM — mmap-able via shared memory fd for zero-copy
-    if (shmemFd >= 0) {
+    if (vramBacking.shmFd >= 0) {
         iovec mmap_areas;
         mmap_areas.iov_base = 0;
         mmap_areas.iov_len = vramSize;
-        ret = vfu_setup_region(vfuCtx, VFU_PCI_DEV_BAR0_REGION_IDX, vramSize,
-                               bar0AccessCb,
-                               VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM,
-                               &mmap_areas, 1, shmemFd, 0);
+        ret = vfu_setup_region(
+            vfuCtx, VFU_PCI_DEV_BAR0_REGION_IDX, vramSize, bar0AccessCb,
+            VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, &mmap_areas, 1,
+            vramBacking.shmFd, vramBacking.shmOffset);
     } else {
         ret = vfu_setup_region(
             vfuCtx, VFU_PCI_DEV_BAR0_REGION_IDX, vramSize, bar0AccessCb,
@@ -341,6 +336,10 @@ MI300XVfioUser::processVfuEvents()
             if (errno == ENOTCONN) {
                 inform("MI300XVfioUser: client disconnected");
                 clientAttached = false;
+                if (vfuPollEvent && vfuPollEvent->queued()) {
+                    pollQueue.remove(vfuPollEvent.get());
+                }
+                vfuPollFd = -1;
                 exitSimLoop("QEMU disconnected", 0);
                 return;
             }
@@ -453,35 +452,17 @@ ssize_t
 MI300XVfioUser::handleFrameAccess(char *buf, size_t count, loff_t offset,
                                   bool is_write)
 {
-    // If VRAM is mmap'd, most accesses bypass this callback.
-    // This handles the fallback case.
-    if (shmemPtr != MAP_FAILED && (uint64_t)(offset + count) <= vramSize) {
-        uint8_t *vram = static_cast<uint8_t *>(shmemPtr) + offset;
-        if (is_write) {
-            memcpy(vram, buf, count);
-        } else {
-            memcpy(buf, vram, count);
-        }
-        return count;
+    const Addr size = vramBacking.range.size();
+    if (offset < 0 || uint64_t(offset) > size || count > size - offset) {
+        errno = EINVAL;
+        return -1;
     }
-
-    // Fall back to per-register access for small accesses
-    if (count <= 8) {
-        if (is_write) {
-            uint64_t data = 0;
-            memcpy(&data, buf, std::min(count, sizeof(data)));
-            gpuFrameWrite(offset, count, data);
-        } else {
-            uint64_t data = gpuFrameRead(offset, count);
-            memcpy(buf, &data, std::min(count, sizeof(data)));
-        }
-        return count;
+    uint8_t *vram = vramBacking.pmem + offset;
+    if (is_write) {
+        memcpy(vram, buf, count);
+    } else {
+        memcpy(buf, vram, count);
     }
-
-    warn("MI300XVfioUser: large Frame access without mmap, "
-         "offset=0x%lx count=%lu",
-         (uint64_t)offset, count);
-    memset(buf, 0, count);
     return count;
 }
 
@@ -636,60 +617,6 @@ MI300XVfioUser::sendIrqLower(uint32_t vector)
 }
 
 // ======================================================================
-// Shared memory (VRAM)
-// ======================================================================
-
-void
-MI300XVfioUser::setupSharedMemory()
-{
-    shmemFd = shm_open(shmemPath.c_str(), O_CREAT | O_RDWR, 0666);
-    if (shmemFd < 0) {
-        warn("MI300XVfioUser: shm_open(%s) failed: %s\n", shmemPath.c_str(),
-             strerror(errno));
-        return;
-    }
-
-    if (ftruncate(shmemFd, vramSize) < 0) {
-        warn("MI300XVfioUser: ftruncate failed: %s\n", strerror(errno));
-        close(shmemFd);
-        shmemFd = -1;
-        return;
-    }
-
-    shmemPtr = mmap(nullptr, vramSize, PROT_READ | PROT_WRITE, MAP_SHARED,
-                    shmemFd, 0);
-    if (shmemPtr == MAP_FAILED) {
-        warn("MI300XVfioUser: mmap failed: %s\n", strerror(errno));
-        close(shmemFd);
-        shmemFd = -1;
-        return;
-    }
-
-    inform("MI300XVfioUser: VRAM shared memory %s mapped at %p (%lu bytes)",
-           shmemPath, shmemPtr, (unsigned long)vramSize);
-
-    gpuDevice->getVM().vramShmemPtr = static_cast<uint8_t *>(shmemPtr);
-    gpuDevice->getVM().vramShmemSize = vramSize;
-    gpuDevice->getVM().setupWalkerCosim();
-}
-
-void
-MI300XVfioUser::cleanupSharedMemory()
-{
-    if (shmemPtr != MAP_FAILED && shmemPtr != nullptr) {
-        munmap(shmemPtr, vramSize);
-        shmemPtr = MAP_FAILED;
-    }
-    if (shmemFd >= 0) {
-        close(shmemFd);
-        shmemFd = -1;
-    }
-    if (!shmemPath.empty()) {
-        shm_unlink(shmemPath.c_str());
-    }
-}
-
-// ======================================================================
 // GPU device forwarding
 // ======================================================================
 
@@ -768,39 +695,6 @@ MI300XVfioUser::gpuDoorbellWrite(uint64_t offset, uint32_t size, uint64_t data)
     pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
 
     gpuDevice->writeDoorbell(pkt, offset);
-    delete pkt;
-}
-
-uint64_t
-MI300XVfioUser::gpuFrameRead(uint64_t offset, uint32_t size)
-{
-    fatal_if(!gpuDevice, "MI300XVfioUser: gpu_device not set");
-
-    uint64_t pkt_data = 0;
-    RequestPtr req = std::make_shared<Request>(offset, size, 0,
-                                               gpuDevice->vramRequestorId());
-    PacketPtr pkt = Packet::createRead(req);
-    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
-
-    gpuDevice->readFrame(pkt, offset);
-
-    uint64_t value = pkt->getUintX(ByteOrder::little);
-    delete pkt;
-    return value;
-}
-
-void
-MI300XVfioUser::gpuFrameWrite(uint64_t offset, uint32_t size, uint64_t data)
-{
-    fatal_if(!gpuDevice, "MI300XVfioUser: gpu_device not set");
-
-    uint64_t pkt_data = htole(data);
-    RequestPtr req = std::make_shared<Request>(offset, size, 0,
-                                               gpuDevice->vramRequestorId());
-    PacketPtr pkt = Packet::createWrite(req);
-    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
-
-    gpuDevice->writeFrame(pkt, offset);
     delete pkt;
 }
 

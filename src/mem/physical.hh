@@ -155,6 +155,9 @@ class PhysicalMemory : public Serializable
 
     const std::string sharedBackstore;
     uint64_t sharedBackstoreSize;
+    const bool sharedBackstoreIsFile;
+    const uint64_t sharedBackstoreOffset;
+    const uint64_t sharedBackstoreLimit;
 
     long pageSize;
 
@@ -187,11 +190,14 @@ class PhysicalMemory : public Serializable
     /**
      * Create a physical memory object, wrapping a number of memories.
      */
-    PhysicalMemory(const std::string& _name,
-                   const std::vector<AbstractMemory*>& _memories,
+    PhysicalMemory(const std::string &_name,
+                   const std::vector<AbstractMemory *> &_memories,
                    bool mmap_using_noreserve,
-                   const std::string& shared_backstore,
-                   bool auto_unlink_shared_backstore);
+                   const std::string &shared_backstore,
+                   bool auto_unlink_shared_backstore,
+                   bool shared_backstore_is_file = false,
+                   uint64_t shared_backstore_offset = 0,
+                   uint64_t shared_backstore_limit = 0);
 
     /**
      * Unmap all the backing store we have used.

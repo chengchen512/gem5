@@ -57,12 +57,11 @@ def createGPU(system, args, gpu_id=0):
         per_lane = True
 
     # List of compute units; one GPU can have multiple compute units
-    cu_id_base = gpu_id * args.num_compute_units
     compute_units = []
     for i in range(args.num_compute_units):
         compute_units.append(
             ComputeUnit(
-                cu_id=cu_id_base + i,
+                cu_id=i,
                 perLaneTLB=per_lane,
                 num_SIMDs=args.simds_per_cu,
                 wf_size=args.wf_size,

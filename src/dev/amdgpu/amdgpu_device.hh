@@ -286,6 +286,8 @@ class AMDGPUDevice : public PciEndpoint
     {
         return vramSize;
     }
+    /** Borrow the contiguous VRAM mapping for the lifetime of this GPU. */
+    memory::BackingStoreEntry getVRAMBacking() const;
     Addr
     getVRAMAddrOffset() const
     {

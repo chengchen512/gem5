@@ -1,0 +1,75 @@
+---
+# SPDX-License-Identifier: BSD-3-Clause
+name: MI300X CI
+
+on:
+    pull_request:
+        branches: [gevico/cosim-gpu]
+        types: [opened, synchronize, reopened, ready_for_review]
+    push:
+        branches: [gevico/cosim-gpu]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: mi300x-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    ci-tests:
+        name: MI300X build and tests
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+        runs-on: ubuntu-24.04
+        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
+        timeout-minutes: 90
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+                  submodules: recursive
+
+            - name: Install MI300X vfio-user and check dependencies
+              run: |
+                  apt-get update
+                  apt-get install -y libjson-c-dev pre-commit clang-format python3-psutil
+                  mkdir -p build/ci-scratch
+                  git config --global --add safe.directory "$GITHUB_WORKSPACE"
+                  git rev-parse --show-toplevel
+                  echo "TMPDIR=$GITHUB_WORKSPACE/build/ci-scratch" >> "$GITHUB_ENV"
+                  echo "PRE_COMMIT_HOME=$GITHUB_WORKSPACE/build/pre-commit" >> "$GITHUB_ENV"
+
+            - name: Check source formatting
+              run: pre-commit run --all-files
+
+            - name: Check C++ formatting in the MI300X patch
+              if: github.event_name == 'pull_request'
+              env:
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+              run: python3 util/run-git-clang-format.py --dry-run --ci-pr-base-commit "$BASE_SHA"
+
+            - name: Restore MI300X build cache
+              uses: actions/cache@v4
+              with:
+                  path: build/VEGA_X86
+                  key: mi300x-${{ runner.os }}-${{ runner.arch }}-v1-${{ github.sha }}
+                  restore-keys: |
+                      mi300x-${{ runner.os }}-${{ runner.arch }}-v1-
+
+            - name: Build MI300X and vfio-user
+              run: scons build/VEGA_X86/gem5.opt -j"$(nproc)"
+
+            - name: Verify MI300X startup and GPU_VIPER
+              run: python3 tests/mi300x/verify.py --gem5 build/VEGA_X86/gem5.opt --output build/mi300x-ci
+
+            - name: Upload MI300X results
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: mi300x-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: |
+                      build/mi300x-ci/
+                      build/VEGA_X86/gem5.build/scons_config.log
+                      build/pre-commit/pre-commit.log
+                  retention-days: 14

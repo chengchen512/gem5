@@ -1039,7 +1039,10 @@ SDMAEngine::srbmWrite(SDMAQueue *q, uint32_t header, sdmaSRBMWrite *pkt)
     sdmaSRBMWriteHeader srbm_header;
     srbm_header.ordinal = header;
 
-    [[maybe_unused]] uint32_t reg_addr = pkt->regAddr << 2;
+    // SDMA 4.4.2 writes the full register DWORD, including AID address bits.
+    const Addr reg_addr = Addr(
+        gpuDevice->getGfxVersion() == GfxVersion::gfx942 ?
+        pkt->ordinal : pkt->regAddr) << 2;
     uint32_t reg_mask = 0x00000000;
 
     if (srbm_header.byteEnable & 0x8) reg_mask |= 0xFF000000;
